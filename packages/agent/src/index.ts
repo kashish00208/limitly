@@ -17,7 +17,6 @@ export async function initAgent() {
   return { repoScanner, issueScorer, healthIndexer, starterPlan };
 }
 
-// Main Orchestrator
 
 export async function runAgent(
   repoUrl: string,
@@ -61,7 +60,7 @@ export async function runAgent(
   };
 }
 
-// Google Cloud Agent Builder Handler
+// Google Cloud Agent Builder Handle
 
 export async function agentHandler(req: any, res: any) {
   try {
