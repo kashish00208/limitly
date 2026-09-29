@@ -4,3 +4,10 @@ interface tokenBucket {
   refilrate: number;
   lastRefileTime: Date;
 }
+
+interface User {
+  id:number;
+  TotalReq:number;
+  remainingReq:number;
+  choseAlgo:["TOkenBucket","FixedLimit"]
+}
