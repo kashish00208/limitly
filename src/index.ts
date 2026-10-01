@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express";
 const app = express();
-import Bucket from "../helper/LimitingAlgo";
+import Bucket from "../helper/rateLimiter";
+import { connectRedis } from "../helper/redis";
 
 app.get("/", (req: Request, res: Response) => {
     res.send("Hello world")
@@ -15,6 +16,7 @@ const rateLimitingMiddleWare = (req:Request,res:Response,next:express.NextFuncti
     }
 }
 
+await connectRedis()
 app.use(rateLimitingMiddleWare)
 
 //Endpoint that return allow or deny based on token bucket algortthm throught client key
