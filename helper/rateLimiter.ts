@@ -1,74 +1,48 @@
-import { Request, Response, NextFunction } from "express";
 import { client } from "../helper/redis";
 
 const CAPACITY = 10;
-const REFIL_RATE = 2;
+const REFILL_RATE = 2;
 
-const tockenBucketScript = `
+const tokenBucketScript = `
+local key = KEYS[1]
 local capacity = tonumber(ARGV[1])
-local refilRate = tonumber(ARGV[2])
+local refillRate = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
 
-local data = redis.call("HMGET","KEYS[1]","tokens","lastrefil)
-
+local data = redis.call("HMGET", key, "tokens", "lastRefill")
 local tokens = tonumber(data[1])
-local lastRefill = tonumber[data[2]]
+local lastRefill = tonumber(data[2])
 
-if tokens == nil then 
+if tokens == nil then
     tokens = capacity
-    lastrefill = now
-end 
+end
+if lastRefill == nil then
+    lastRefill = now
+end
 
-local elasped = (now - lastRefill)/1000
-local newTokens = elasped * refilRate 
+local elapsed = math.max(0, now - lastRefill) / 1000
+tokens = math.min(capacity, tokens + elapsed * refillRate)
 
-tokens = math.min(capacity,tokens+newTokens)
-
-local allowed = 0 
-
-if tokens >= 1 then 
+local allowed = 0
+if tokens >= 1 then
     tokens = tokens - 1
     allowed = 1
-end 
+end
 
-redis.call(
-    "HSET",
-    "KEYS[1]",
-    "tokens","tokens",
-    "lastRefill",now
-)
+redis.call("HSET", key, "tokens", tokens, "lastRefill", now)
+redis.call("EXPIRE", key, 60)
 
-redis.call("EXPIRE",KEYS[1],60)
-
-return {allowed,tokens}
-
+return allowed
 `;
 
-export async function rateLimiter(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-) {
-  const clientIP = req.ip || "Unknown";
-
-  const key = `rate-limit:${clientIP}`;
-
+export async function rateLimiter(clientKey: string): Promise<"ALLOW" | "DENY"> {
+  const key = `rate-limit:${clientKey}`;
   const now = Date.now();
 
-  const result = await client.eval(tockenBucketScript, {
+  const result = await client.eval(tokenBucketScript, {
     keys: [key],
-    arguments: [CAPACITY.toString(), REFIL_RATE.toString(), now.toString()],
+    arguments: [CAPACITY.toString(), REFILL_RATE.toString(), now.toString()],
   });
 
-  const [allowed, tokens] = result as [number, number];
-
-  if (allowed === 1) {
-    next();
-    return;
-  }
-
-  res.status(429).json({
-    message: "Too many requests",
-    retryAfter: 1,
-  });
+  return Number(result) === 1 ? "ALLOW" : "DENY";
 }

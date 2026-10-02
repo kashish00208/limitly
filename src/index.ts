@@ -8,12 +8,27 @@ app.get("/", (req: Request, res: Response) => {
   res.send("Hello world");
 });
 
-async function main() {
-    await connectRedis();
+app.post("/api-gateway", async (req: Request, res: Response) => {
+    const clientKey = req.get("x-client-key")?.trim();
 
-    app.listen(8080,()=>{
-        console.log("Server is running on PORT 8080")
-    })
+    if (!clientKey) {
+        return res.status(400).json({ error: "x-client-key header is required" });
+    }
+
+    const decision = await rateLimiter(clientKey);
+    const status = decision === "ALLOW" ? 200 : 429;
+
+    return res.status(status).json({ decision });
+});
+
+async function startServer() {
+    await connectRedis();
+    app.listen(8080, () => {
+        console.log("Service is running on Port 8080");
+    });
 }
 
-main()
+startServer().catch((error: unknown) => {
+    console.error("Failed to start service", error);
+    process.exitCode = 1;
+});
