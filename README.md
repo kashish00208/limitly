@@ -1,198 +1,116 @@
 # limitly
 
-> A standalone, persistent API rate-limiting service built from scratch using the Token Bucket algorithm.
+> A standalone, persistent rate-limiting service with token bucket and sliding-window algorithms, backed by Redis.
 
-limitly is a networked rate-limiting service that other applications can call to determine whether a request should be **allowed or denied**.
-
-Unlike implementing rate limiting as middleware inside an application, limitly runs as an independent service. It focuses on the underlying engineering problems behind rate limiting: **concurrency, shared state, persistence, configurable limits, and correctness under load**.
-
-## Why limitly?
-
-Rate limiting is commonly implemented by importing a library or adding middleware to an existing API.
-
-limitly takes a different approach: build the rate limiter itself as a standalone service.
-
-This makes the project a practical exploration of:
-
-* Token bucket algorithms
-* Concurrent request handling
-* Persistent state
-* Race-condition prevention
-* API design
-* Rate-limit headers
-* Load testing
-* Distributed systems
+limitly is a networked service that other applications call to get an **ALLOW / DENY** decision for a client key. Instead of importing a library or adding middleware, rate limiting runs as its own service, which forces real handling of shared state, concurrency, persistence, and correctness under load.
 
 ## Features
 
-### Core
-
-* Token Bucket rate-limiting algorithm
-* Per-client configurable limits
-* Configurable requests-per-second rate
-* Configurable burst capacity
-* Persistent bucket state
-* Concurrency-safe request handling
-* Standard rate-limit response headers
-* Admin API for configuring clients
-
-### Multiple Algorithms
-
-limitly supports:
-
-* **Token Bucket**
-* **Sliding Window**
-
-The algorithm can be configured per client.
-
-### Reliability
-
-Rate-limit state survives service restarts instead of existing only in application memory.
-
-Concurrent requests for the same client are handled safely so that tokens cannot be double-spent because of race conditions.
-
-### Load Testing
-
-The project includes load tests designed to verify rate-limiting correctness under **500+ requests per second**.
+- Token bucket and sliding-window modes, selectable per client
+- Per-client limits (rate, burst) via an admin API
+- Race-safe: each decision is one atomic Redis Lua script, so tokens can't be double-spent
+- State persisted with Redis AOF, survives restarts
+- Rate-limit headers on every response
+- Time sourced from Redis `TIME`, so multiple app instances don't drift
+- Load test verifying correctness under 500+ concurrent requests
 
 ## How It Works
 
-For the Token Bucket algorithm, each client has an associated bucket containing a number of tokens.
-
 ```text
-                Request
-                   │
-                   ▼
-            ┌─────────────┐
-            │   limitly │
-            └──────┬──────┘
-                   │
-             Identify client
-                   │
-                   ▼
-            ┌─────────────┐
-            │ Token Bucket│
-            └──────┬──────┘
-                   │
-             ┌─────┴─────┐
-             │           │
-        Token available  No token
-             │           │
-             ▼           ▼
-          ALLOW         DENY
+Request ──► limitly ──► Redis (Lua script, atomic per client)
+                           │
+                           ├─ read client config
+                           ├─ refill tokens / prune window
+                           ├─ consume if available
+                           └─ persist state
+                           │
+                 ┌─────────┴─────────┐
+              ALLOW (200)         DENY (429)
 ```
 
-Tokens are replenished according to the configured rate.
+**Token bucket:** refills `rate` tokens/sec up to `burst`. A client can spend up to `burst` immediately, then is limited to `rate`.
 
-For example:
+**Sliding window:** allows `floor(rate)` requests per rolling 1s window. `burst` is ignored in this mode.
 
-```text
-Rate: 10 requests/second
-Burst: 20 requests
+If a client has one token left, two concurrent requests resolve to one `ALLOW` and one `DENY`.
 
-Client can immediately consume up to 20 tokens,
-then tokens are replenished at 10 tokens/second.
+## Run
+
+```bash
+# Redis with persistence
+docker run -d -p 6379:6379 -v rl-data:/data redis:7 \
+  redis-server --appendonly yes --appendfsync everysec
+
+# Service
+npm install
+export ADMIN_TOKEN=change-me
+bun run src/index.ts   # or: npx tsx src/index.ts
 ```
+
+Listens on `:8080`. `--appendfsync everysec` can lose up to ~1s of writes on a crash; use `always` for strict durability at a throughput cost.
 
 ## API
 
-### Check Rate Limit
+### Check rate limit
 
 ```http
-POST /v1/ratelimit/check
+POST /api-gateway
+x-client-key: user_123
 ```
 
-Example request:
+| Status | Body | Meaning |
+|---|---|---|
+| 200 | `{"decision":"ALLOW"}` | Allowed |
+| 429 | `{"decision":"DENY"}` | Rate limited |
+| 400 | `{"error":"..."}` | Missing `x-client-key` |
+| 503 | `{"error":"..."}` | Redis unavailable |
 
-```json
-{
-  "clientKey": "user_123"
-}
-```
-
-Example allowed response:
-
-```json
-{
-  "decision": "ALLOW",
-  "remaining": 9,
-  "reset": 1
-}
-```
-
-Example denied response:
-
-```json
-{
-  "decision": "DENY",
-  "remaining": 0,
-  "reset": 1
-}
-```
-
-### Configure Client
+### Configure client
 
 ```http
-POST /v1/admin/clients
+PUT /admin/clients/user_123
+x-admin-token: <ADMIN_TOKEN>
+Content-Type: application/json
+
+{ "mode": "token_bucket", "rate": 10, "burst": 20 }
 ```
 
-Example:
+| Field | Values |
+|---|---|
+| `mode` | `token_bucket` \| `sliding_window` |
+| `rate` | number > 0 (tokens/sec, or requests per 1s window) |
+| `burst` | integer >= 1 (token bucket only) |
 
-```json
-{
-  "clientKey": "user_123",
-  "algorithm": "token-bucket",
-  "requestsPerSecond": 10,
-  "burstSize": 20
-}
-```
+`GET /admin/clients/:key` returns the current config. Unconfigured clients default to token bucket, 2/s, burst 10.
 
 ## Rate-Limit Headers
 
-Responses include standard rate-limit information such as:
+Sent on every response:
 
 ```http
-X-RateLimit-Limit: 10
+X-RateLimit-Limit: 20
 X-RateLimit-Remaining: 7
-X-RateLimit-Reset: 1
+X-RateLimit-Reset: 1760000000
+Retry-After: 1
 ```
 
-These allow consuming services to understand their current request allowance.
+- `X-RateLimit-Reset`: unix seconds when the allowance is fully restored (token bucket) or the window frees up (sliding window)
+- `Retry-After`: seconds, only on 429
 
-## Persistence
+## Load Test
 
-limitly persists rate-limit state so that restarting the service does not reset every client's bucket.
+```bash
+# Correctness: exactly `burst` of 1000 concurrent requests must be allowed
+npx tsx loadtest/correctness.ts
 
-```text
-Request
-   │
-   ▼
-limitly
-   │
-   ├── Read client configuration
-   │
-   ├── Read bucket state
-   │
-   ├── Refill tokens
-   │
-   ├── Atomically consume token
-   │
-   └── Persist updated state
+# Throughput
+npx autocannon -c 200 -d 15 -m POST -H x-client-key=load-1 http://localhost:8080/api-gateway
 ```
 
-## Concurrency
+Under sustained load, allowed requests should track `rate × duration + burst` for the token bucket.
 
-A critical requirement of limitly is preventing two concurrent requests from consuming the same token.
+## Design Notes
 
-For example, if a client has exactly one token:
-
-```text
-Request A ──┐
-            ├──► limitly ──► 1 token ──► ALLOW
-Request B ──┘                         └──► DENY
-```
-
-The state transition must be atomic for the same client key.
-
-This prevents race conditions and incorrect request allowances under high concurrency.
-
+- **Atomicity:** config read, refill, consume, and write happen in a single Lua script, so Redis serializes them per key.
+- **Persistence:** bucket state lives in Redis; keys expire only after a bucket would be full again, so expiry loses no information.
+- **Failure mode:** if Redis is down, the service returns 503 (fail-closed).
