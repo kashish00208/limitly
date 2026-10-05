@@ -1,77 +1,100 @@
-import { client } from "../helper/redis";
+import { randomUUID } from "node:crypto";
+import { client } from "./redis";
 
-const CAPACITY = 10;
-const REFILL_RATE = 2;
+export type Mode = "token_bucket" | "sliding_window";
+export interface ClientConfig { mode: Mode; rate: number; burst: number }
 
-const tokenBucketScript = `
-local key = KEYS[1]
-local capacity = tonumber(ARGV[1])
-local refillRate = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
+export const DEFAULT_CONFIG: ClientConfig = { mode: "token_bucket", rate: 2, burst: 10 };
 
-local data = redis.call("HMGET", key, "tokens", "lastRefill")
-local tokens = tonumber(data[1])
-local lastRefill = tonumber(data[2])
+export interface Decision {
+  allowed: boolean;
+  limit: number;
+  remaining: number;
+  resetMs: number;
+  retryAfterMs: number;
+}
 
-if tokens == nil then
-    tokens = capacity
+const script = `
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+
+local cfg = redis.call('HMGET', KEYS[1], 'mode', 'rate', 'burst')
+local mode  = cfg[1] or ARGV[1]
+local rate  = tonumber(cfg[2] or ARGV[2])
+local burst = tonumber(cfg[3] or ARGV[3])
+local stateKey = KEYS[2] .. ':' .. mode
+
+if mode == 'token_bucket' then
+  local d = redis.call('HMGET', stateKey, 'tokens', 'ts')
+  local tokens = tonumber(d[1]) or burst
+  local ts = tonumber(d[2]) or now
+  tokens = math.min(burst, tokens + math.max(0, now - ts) / 1000 * rate)
+
+  local allowed = 0
+  if tokens >= 1 then tokens = tokens - 1; allowed = 1 end
+
+  redis.call('HSET', stateKey, 'tokens', tokens, 'ts', now)
+  -- a bucket idle this long is full anyway, so expiry loses nothing
+  redis.call('PEXPIRE', stateKey, math.ceil(burst / rate * 1000) + 1000)
+
+  local resetMs = math.ceil((burst - tokens) / rate * 1000)
+  local retryMs = 0
+  if allowed == 0 then retryMs = math.ceil((1 - tokens) / rate * 1000) end
+  return { allowed, burst, math.floor(tokens), resetMs, retryMs }
 end
-if lastRefill == nil then
-    lastRefill = now
-end
 
-local elapsed = math.max(0, now - lastRefill) / 1000
-tokens = math.min(capacity, tokens + elapsed * refillRate)
+-- sliding window log: limit = floor(rate) requests per 1s
+local limit = math.max(1, math.floor(rate))
+local windowMs = 1000
+redis.call('ZREMRANGEBYSCORE', stateKey, 0, now - windowMs)
+local count = redis.call('ZCARD', stateKey)
 
 local allowed = 0
-if tokens >= 1 then
-    tokens = tokens - 1
-    allowed = 1
+if count < limit then
+  redis.call('ZADD', stateKey, now, ARGV[4])
+  allowed = 1
+  count = count + 1
 end
+redis.call('PEXPIRE', stateKey, windowMs)
 
-redis.call("HSET", key, "tokens", tokens, "lastRefill", now)
-redis.call("EXPIRE", key, 60)
-
-return allowed
+local first = redis.call('ZRANGE', stateKey, 0, 0, 'WITHSCORES')
+local resetMs = windowMs
+if first[2] then resetMs = tonumber(first[2]) + windowMs - now end
+local retryMs = 0
+if allowed == 0 then retryMs = resetMs end
+return { allowed, limit, limit - count, resetMs, retryMs }
 `;
 
-const fixedWindowScript = `
-local key = KEYS[1]
-local max_requests = tonumber(ARGV[1])
-local window_seconds = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
-local member = ARGV[4]
+export async function rateLimiter(clientKey: string): Promise<Decision> {
+  const r = (await client.eval(script, {
+    keys: [`rl:config:${clientKey}`, `rl:state:${clientKey}`],
+    arguments: [
+      DEFAULT_CONFIG.mode,
+      String(DEFAULT_CONFIG.rate),
+      String(DEFAULT_CONFIG.burst),
+      randomUUID(), 
+    ],
+  })) as number[];
 
-local window_start = now - window_seconds * 1000
+  return {
+    allowed: r[0] === 1,
+    limit: r[1],
+    remaining: Math.max(0, r[2]),
+    resetMs: r[3],
+    retryAfterMs: r[4],
+  };
+}
 
-redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
-
-local count = redis.call('ZCARD', key)
-
-if count < max_requests then
-  redis.call('ZADD', key, now, member)
-  redis.call('EXPIRE', key, window_seconds)
-  return { 1, max_requests - count - 1, 0 }
-end
-
--- Denied: find oldest entry to compute retry-after (in ms)
-local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-local retry_after_ms = window_seconds * 1000
-if #oldest >= 2 then
-  retry_after_ms = oldest[2] + window_seconds * 1000 - now
-end
-
-return { 0, 0, retry_after_ms }
-`;
-
-export async function rateLimiter(clientKey: string): Promise<"ALLOW" | "DENY"> {
-  const key = `rate-limit:${clientKey}`;
-  const now = Date.now();
-
-  const result = await client.eval(tokenBucketScript, {
-    keys: [key],
-    arguments: [CAPACITY.toString(), REFILL_RATE.toString(), now.toString()],
+export async function setClientConfig(clientKey: string, cfg: ClientConfig) {
+  await client.hSet(`rl:config:${clientKey}`, {
+    mode: cfg.mode,
+    rate: String(cfg.rate),
+    burst: String(cfg.burst),
   });
+}
 
-  return Number(result) === 1 ? "ALLOW" : "DENY";
+export async function getClientConfig(clientKey: string): Promise<ClientConfig> {
+  const h = await client.hGetAll(`rl:config:${clientKey}`);
+  if (!h.mode) return DEFAULT_CONFIG;
+  return { mode: h.mode as Mode, rate: Number(h.rate), burst: Number(h.burst) };
 }
